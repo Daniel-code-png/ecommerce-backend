@@ -3,31 +3,32 @@ import mongoose from 'mongoose';
 import cors from 'cors';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import { v2 as cloudinary } from 'cloudinary';
 
 const app = express();
 
+// Configurar Cloudinary (servicio de imágenes GRATIS)
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
+});
+
 // Middlewares
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' })); // Permitir imágenes base64
 
-// Conexión MongoDB con cache para Vercel
+// Conexión MongoDB con cache
 let cachedDb = null;
 async function connectDB() {
-  if (cachedDb) {
-    return cachedDb;
-  }
-  
-  const conn = await mongoose.connect(process.env.MONGODB_URI, {
-    bufferCommands: false,
-  });
-  
+  if (cachedDb) return cachedDb;
+  const conn = await mongoose.connect(process.env.MONGODB_URI, { bufferCommands: false });
   cachedDb = conn;
   console.log('✅ Conectado a MongoDB');
   return conn;
 }
 
-// ==================== MODELOS ====================
-
+// MODELOS (igual que antes)
 const userSchema = new mongoose.Schema({
   name: { type: String, required: true, trim: true },
   email: { type: String, required: true, unique: true, lowercase: true, trim: true },
@@ -67,11 +68,7 @@ const orderSchema = new mongoose.Schema({
     image: String
   }],
   totalAmount: { type: Number, required: true, min: 0 },
-  status: {
-    type: String,
-    enum: ['pending', 'processing', 'completed', 'cancelled'],
-    default: 'completed'
-  },
+  status: { type: String, enum: ['pending', 'processing', 'completed', 'cancelled'], default: 'completed' },
   createdAt: { type: Date, default: Date.now }
 });
 
@@ -79,23 +76,16 @@ const User = mongoose.models.User || mongoose.model('User', userSchema);
 const Product = mongoose.models.Product || mongoose.model('Product', productSchema);
 const Order = mongoose.models.Order || mongoose.model('Order', orderSchema);
 
-// ==================== MIDDLEWARE AUTENTICACIÓN ====================
-
+// MIDDLEWARE AUTENTICACIÓN
 const authenticate = async (req, res, next) => {
   try {
     const token = req.header('Authorization')?.replace('Bearer ', '');
+    if (!token) return res.status(401).json({ message: 'No token' });
     
-    if (!token) {
-      return res.status(401).json({ message: 'No token, autorización denegada' });
-    }
-
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     const user = await User.findById(decoded.userId).select('-password');
+    if (!user) return res.status(401).json({ message: 'Token inválido' });
     
-    if (!user) {
-      return res.status(401).json({ message: 'Token inválido' });
-    }
-
     req.user = user;
     next();
   } catch (error) {
@@ -105,34 +95,29 @@ const authenticate = async (req, res, next) => {
 
 const isAdmin = (req, res, next) => {
   if (!req.user.isAdmin) {
-    return res.status(403).json({ message: 'Acceso denegado. Se requieren permisos de administrador' });
+    return res.status(403).json({ message: 'Requiere permisos de admin' });
   }
   next();
 };
 
-// ==================== RUTAS DE AUTENTICACIÓN ====================
-
+// ==================== RUTAS AUTH ====================
 app.post('/api/auth/register', async (req, res) => {
   await connectDB();
   try {
     const { name, email, password } = req.body;
-
     const existingUser = await User.findOne({ email });
-    if (existingUser) {
-      return res.status(400).json({ message: 'El email ya está registrado' });
-    }
-
+    if (existingUser) return res.status(400).json({ message: 'El email ya está registrado' });
+    
     const user = new User({ name, email, password, isAdmin: false });
     await user.save();
-
+    
     const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
-
     res.status(201).json({
       token,
       user: { id: user._id, name: user.name, email: user.email, isAdmin: user.isAdmin }
     });
   } catch (error) {
-    res.status(500).json({ message: 'Error al registrar usuario', error: error.message });
+    res.status(500).json({ message: error.message });
   }
 });
 
@@ -140,74 +125,41 @@ app.post('/api/auth/login', async (req, res) => {
   await connectDB();
   try {
     const { email, password } = req.body;
-
     const user = await User.findOne({ email });
-    if (!user) {
-      return res.status(401).json({ message: 'Credenciales inválidas' });
-    }
-
+    if (!user) return res.status(401).json({ message: 'Credenciales inválidas' });
+    
     const isMatch = await user.comparePassword(password);
-    if (!isMatch) {
-      return res.status(401).json({ message: 'Credenciales inválidas' });
-    }
-
+    if (!isMatch) return res.status(401).json({ message: 'Credenciales inválidas' });
+    
     const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
-
     res.json({
       token,
       user: { id: user._id, name: user.name, email: user.email, isAdmin: user.isAdmin }
     });
   } catch (error) {
-    res.status(500).json({ message: 'Error al iniciar sesión', error: error.message });
+    res.status(500).json({ message: error.message });
   }
 });
 
 app.get('/api/auth/me', authenticate, async (req, res) => {
   res.json({
-    user: {
-      id: req.user._id,
-      name: req.user.name,
-      email: req.user.email,
-      isAdmin: req.user.isAdmin
-    }
+    user: { id: req.user._id, name: req.user.name, email: req.user.email, isAdmin: req.user.isAdmin }
   });
 });
 
-// ==================== RUTAS DE PRODUCTOS ====================
-
+// ==================== RUTAS PRODUCTOS ====================
 app.get('/api/products', async (req, res) => {
   await connectDB();
   try {
     const { category, search } = req.query;
     let query = {};
-
-    if (category) {
-      query.category = category;
-    }
-
-    if (search) {
-      query.name = { $regex: search, $options: 'i' };
-    }
-
+    if (category) query.category = category;
+    if (search) query.name = { $regex: search, $options: 'i' };
+    
     const products = await Product.find(query).sort({ createdAt: -1 });
     res.json(products);
   } catch (error) {
-    res.status(500).json({ message: 'Error al obtener productos', error: error.message });
-  }
-});
-
-app.get('/api/products/:id', async (req, res) => {
-  await connectDB();
-  try {
-    const product = await Product.findById(req.params.id);
-    
-    if (!product) {
-      return res.status(404).json({ message: 'Producto no encontrado' });
-    }
-
-    res.json(product);
-  } catch (error) {
-    res.status(500).json({ message: 'Error al obtener producto', error: error.message });
+    res.status(500).json({ message: error.message });
   }
 });
 
@@ -217,15 +169,44 @@ app.get('/api/products/categories/list', async (req, res) => {
     const categories = await Product.distinct('category');
     res.json(categories);
   } catch (error) {
-    res.status(500).json({ message: 'Error al obtener categorías', error: error.message });
+    res.status(500).json({ message: error.message });
   }
 });
 
-// Crear producto - SOLO RECIBE URL DE IMAGEN
+app.get('/api/products/:id', async (req, res) => {
+  await connectDB();
+  try {
+    const product = await Product.findById(req.params.id);
+    if (!product) return res.status(404).json({ message: 'Producto no encontrado' });
+    res.json(product);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// CREAR PRODUCTO - Recibe imagen en Base64 y la sube a Cloudinary
 app.post('/api/products', authenticate, isAdmin, async (req, res) => {
   await connectDB();
   try {
-    const { name, description, price, category, stock, image } = req.body;
+    const { name, description, price, category, stock, imageBase64 } = req.body;
+    
+    let imageUrl = 'https://via.placeholder.com/300x300?text=Sin+Imagen';
+    
+    // Si viene imagen en base64, subirla a Cloudinary
+    if (imageBase64) {
+      try {
+        const uploadResult = await cloudinary.uploader.upload(imageBase64, {
+          folder: 'ecommerce/products',
+          transformation: [
+            { width: 500, height: 500, crop: 'limit' }
+          ]
+        });
+        imageUrl = uploadResult.secure_url;
+      } catch (uploadError) {
+        console.error('Error al subir imagen:', uploadError);
+        return res.status(400).json({ message: 'Error al subir imagen' });
+      }
+    }
 
     const product = new Product({
       name,
@@ -233,21 +214,21 @@ app.post('/api/products', authenticate, isAdmin, async (req, res) => {
       price: Number(price),
       category,
       stock: Number(stock),
-      image: image || 'https://via.placeholder.com/300x300?text=Sin+Imagen'
+      image: imageUrl
     });
 
     await product.save();
     res.status(201).json(product);
   } catch (error) {
-    res.status(500).json({ message: 'Error al crear producto', error: error.message });
+    res.status(500).json({ message: error.message });
   }
 });
 
-// Actualizar producto - SOLO RECIBE URL DE IMAGEN
+// ACTUALIZAR PRODUCTO
 app.put('/api/products/:id', authenticate, isAdmin, async (req, res) => {
   await connectDB();
   try {
-    const { name, description, price, category, stock, image } = req.body;
+    const { name, description, price, category, stock, imageBase64 } = req.body;
     
     const updateData = {
       name,
@@ -257,23 +238,28 @@ app.put('/api/products/:id', authenticate, isAdmin, async (req, res) => {
       stock: Number(stock)
     };
 
-    if (image) {
-      updateData.image = image;
+    // Si viene nueva imagen, subirla
+    if (imageBase64) {
+      try {
+        const uploadResult = await cloudinary.uploader.upload(imageBase64, {
+          folder: 'ecommerce/products',
+          transformation: [
+            { width: 500, height: 500, crop: 'limit' }
+          ]
+        });
+        updateData.image = uploadResult.secure_url;
+      } catch (uploadError) {
+        console.error('Error al subir imagen:', uploadError);
+        return res.status(400).json({ message: 'Error al subir imagen' });
+      }
     }
 
-    const product = await Product.findByIdAndUpdate(
-      req.params.id,
-      updateData,
-      { new: true, runValidators: true }
-    );
-
-    if (!product) {
-      return res.status(404).json({ message: 'Producto no encontrado' });
-    }
-
+    const product = await Product.findByIdAndUpdate(req.params.id, updateData, { new: true });
+    if (!product) return res.status(404).json({ message: 'Producto no encontrado' });
+    
     res.json(product);
   } catch (error) {
-    res.status(500).json({ message: 'Error al actualizar producto', error: error.message });
+    res.status(500).json({ message: error.message });
   }
 });
 
@@ -281,24 +267,18 @@ app.delete('/api/products/:id', authenticate, isAdmin, async (req, res) => {
   await connectDB();
   try {
     const product = await Product.findByIdAndDelete(req.params.id);
-
-    if (!product) {
-      return res.status(404).json({ message: 'Producto no encontrado' });
-    }
-
-    res.json({ message: 'Producto eliminado correctamente' });
+    if (!product) return res.status(404).json({ message: 'Producto no encontrado' });
+    res.json({ message: 'Producto eliminado' });
   } catch (error) {
-    res.status(500).json({ message: 'Error al eliminar producto', error: error.message });
+    res.status(500).json({ message: error.message });
   }
 });
 
-// ==================== RUTAS DE ÓRDENES ====================
-
+// ==================== RUTAS ÓRDENES ====================
 app.post('/api/orders', authenticate, async (req, res) => {
   await connectDB();
   try {
     const { items } = req.body;
-
     if (!items || items.length === 0) {
       return res.status(400).json({ message: 'El carrito está vacío' });
     }
@@ -308,20 +288,12 @@ app.post('/api/orders', authenticate, async (req, res) => {
 
     for (const item of items) {
       const product = await Product.findById(item.productId);
-      
-      if (!product) {
-        return res.status(404).json({ message: `Producto ${item.productId} no encontrado` });
-      }
-
+      if (!product) return res.status(404).json({ message: `Producto no encontrado` });
       if (product.stock < item.quantity) {
-        return res.status(400).json({ 
-          message: `Stock insuficiente para ${product.name}. Disponible: ${product.stock}` 
-        });
+        return res.status(400).json({ message: `Stock insuficiente para ${product.name}` });
       }
 
-      const itemTotal = product.price * item.quantity;
-      totalAmount += itemTotal;
-
+      totalAmount += product.price * item.quantity;
       orderItems.push({
         product: product._id,
         name: product.name,
@@ -343,13 +315,9 @@ app.post('/api/orders', authenticate, async (req, res) => {
     });
 
     await order.save();
-
-    res.status(201).json({
-      message: '¡Pago procesado! Tu pedido ha sido confirmado',
-      order
-    });
+    res.status(201).json({ message: '¡Pago procesado!', order });
   } catch (error) {
-    res.status(500).json({ message: 'Error al procesar orden', error: error.message });
+    res.status(500).json({ message: error.message });
   }
 });
 
@@ -359,10 +327,9 @@ app.get('/api/orders/my-orders', authenticate, async (req, res) => {
     const orders = await Order.find({ user: req.user._id })
       .populate('items.product')
       .sort({ createdAt: -1 });
-    
     res.json(orders);
   } catch (error) {
-    res.status(500).json({ message: 'Error al obtener órdenes', error: error.message });
+    res.status(500).json({ message: error.message });
   }
 });
 
@@ -373,88 +340,51 @@ app.get('/api/orders/all', authenticate, isAdmin, async (req, res) => {
       .populate('user', 'name email')
       .populate('items.product')
       .sort({ createdAt: -1 });
-    
     res.json(orders);
   } catch (error) {
-    res.status(500).json({ message: 'Error al obtener órdenes', error: error.message });
+    res.status(500).json({ message: error.message });
   }
 });
 
-app.get('/api/orders/:id', authenticate, async (req, res) => {
-  await connectDB();
-  try {
-    const order = await Order.findById(req.params.id)
-      .populate('user', 'name email')
-      .populate('items.product');
-
-    if (!order) {
-      return res.status(404).json({ message: 'Orden no encontrada' });
-    }
-
-    if (order.user._id.toString() !== req.user._id.toString() && !req.user.isAdmin) {
-      return res.status(403).json({ message: 'No autorizado' });
-    }
-
-    res.json(order);
-  } catch (error) {
-    res.status(500).json({ message: 'Error al obtener orden', error: error.message });
-  }
-});
-
-// ==================== RUTAS DE ESTADÍSTICAS ====================
-
+// ==================== RUTAS ESTADÍSTICAS ====================
 app.get('/api/stats', authenticate, isAdmin, async (req, res) => {
   await connectDB();
   try {
     const totalSalesResult = await Order.aggregate([
       { $group: { _id: null, total: { $sum: '$totalAmount' } } }
     ]);
-    const totalSales = totalSalesResult.length > 0 ? totalSalesResult[0].total : 0;
-
+    const totalSales = totalSalesResult[0]?.total || 0;
+    
     const totalOrders = await Order.countDocuments();
     const totalUsers = await User.countDocuments({ isAdmin: false });
     const totalProducts = await Product.countDocuments();
-
-    const topProducts = await Product.find()
-      .sort({ sold: -1 })
-      .limit(5)
-      .select('name sold price image');
-
+    const topProducts = await Product.find().sort({ sold: -1 }).limit(5);
+    
     const sixMonthsAgo = new Date();
     sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
-
+    
     const salesByMonth = await Order.aggregate([
       { $match: { createdAt: { $gte: sixMonthsAgo } } },
       {
         $group: {
-          _id: {
-            year: { $year: '$createdAt' },
-            month: { $month: '$createdAt' }
-          },
+          _id: { year: { $year: '$createdAt' }, month: { $month: '$createdAt' } },
           total: { $sum: '$totalAmount' },
           count: { $sum: 1 }
         }
       },
       { $sort: { '_id.year': 1, '_id.month': 1 } }
     ]);
-
+    
     const monthNames = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic'];
     const formattedSalesByMonth = salesByMonth.map(item => ({
       month: `${monthNames[item._id.month - 1]} ${item._id.year}`,
       total: item.total,
       orders: item.count
     }));
-
+    
     const salesByCategory = await Order.aggregate([
       { $unwind: '$items' },
-      {
-        $lookup: {
-          from: 'products',
-          localField: 'items.product',
-          foreignField: '_id',
-          as: 'productInfo'
-        }
-      },
+      { $lookup: { from: 'products', localField: 'items.product', foreignField: '_id', as: 'productInfo' } },
       { $unwind: '$productInfo' },
       {
         $group: {
@@ -465,49 +395,36 @@ app.get('/api/stats', authenticate, isAdmin, async (req, res) => {
       },
       { $sort: { total: -1 } }
     ]);
-
+    
     const formattedSalesByCategory = salesByCategory.map(item => ({
       category: item._id,
       total: item.total,
       quantity: item.quantity
     }));
-
+    
     const recentOrders = await Order.find()
       .populate('user', 'name email')
       .sort({ createdAt: -1 })
-      .limit(5)
-      .select('totalAmount createdAt status');
-
+      .limit(5);
+    
     res.json({
-      overview: {
-        totalSales,
-        totalOrders,
-        totalUsers,
-        totalProducts
-      },
+      overview: { totalSales, totalOrders, totalUsers, totalProducts },
       topProducts,
       salesByMonth: formattedSalesByMonth,
       salesByCategory: formattedSalesByCategory,
       recentOrders
     });
   } catch (error) {
-    res.status(500).json({ message: 'Error al obtener estadísticas', error: error.message });
+    res.status(500).json({ message: error.message });
   }
 });
 
-// Ruta de prueba
 app.get('/api', (req, res) => {
   res.json({ message: '🚀 API E-commerce funcionando correctamente' });
 });
 
 app.get('/', (req, res) => {
   res.json({ message: '🚀 API E-commerce funcionando correctamente' });
-});
-
-// Manejo de errores
-app.use((err, req, res, next) => {
-  console.error(err.stack);
-  res.status(500).json({ message: 'Algo salió mal!', error: err.message });
 });
 
 export default app;
